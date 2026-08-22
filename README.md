@@ -15,7 +15,7 @@ Compiled releases and English readme: <https://github.com/cdhigh/sprintFontRelea
 * 插入泪滴焊盘
 * 生成圆弧走线
 * 差分线长度匹配
-* 导出到Kicad/SVG/OpenSCAD
+* Export to Kicad PCB/Footprint/SVG/OpenSCAD
 
 
 
@@ -343,6 +343,13 @@ Kicad自带很多封装库，如果不想安装Kicad，也可以仅仅下载封�
 
 
 ## 4. 版本更新日志
+
+### v1.10
+  1. Add KiCad Footprint (.kicad_mod) export feature
+  2. Redesign Export tab with format dropdown (KiCad PCB, KiCad Footprint, EasyEDA JSON, OpenSCAD, SVG)
+  3. Dynamic UI: Component combo only enabled for KiCad Footprint; Layer combo and checkbox only for OpenSCAD/SVG
+  4. Component list auto-populates when selecting KiCad Footprint format
+  5. Pad number priority: NAME (if numeric) > padId > default '1'
 
 ### v1.9
   1. 添加 "批处理修改" 功能

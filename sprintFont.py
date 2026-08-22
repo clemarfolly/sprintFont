@@ -228,6 +228,7 @@ class Application(Application_ui):
                 self.txtFootprintFile.focus_set()
             elif tabNo == TAB_EXPORT:
                 self.txtExportFile.focus_set()
+                self.cmdExportFormat_Cmd()
             elif tabNo == TAB_SVG:
                 self.txtSvgFile.focus_set()
             elif tabNo == TAB_AUTOROUTER:
@@ -511,31 +512,34 @@ class Application(Application_ui):
 
     #选择一个导出文件
     def cmdChooseExportFile_Cmd(self, event=None):
-        selectedFilter = StringVar()
-        FILE_TYPES_MAP = {
-            _("All supported files"): "",
-            _("KiCad PCB files"): ".kicad_pcb",
-            _("EasyEDA JSON files"): ".json",
-            _("OpenSCAD files"): ".scad",
-            _("SVG files"): ".svg",
-            _("All files"): ""
+        FORMAT_EXT_MAP = {
+            'KiCad PCB (*.kicad_pcb)': '.kicad_pcb',
+            'KiCad Footprint (*.kicad_mod)': '.kicad_mod',
+            'EasyEDA JSON (*.json)': '.json',
+            'OpenSCAD (*.scad)': '.scad',
+            'SVG (*.svg)': '.svg',
         }
+        FILE_TYPE_MAP = {
+            '.kicad_pcb': (_("KiCad PCB files"), "*.kicad_pcb"),
+            '.kicad_mod': (_("KiCad footprint files"), "*.kicad_mod"),
+            '.json': (_("EasyEDA JSON files"), "*.json"),
+            '.scad': (_("OpenSCAD files"), "*.scad"),
+            '.svg': (_("SVG files"), "*.svg"),
+        }
+        fmtText = self.cmbExportFormat.text()
+        fmt = FORMAT_EXT_MAP.get(fmtText, '.kicad_pcb')
+        fmtInfo = FILE_TYPE_MAP.get(fmt, (_("All files"), "*.*"))
         ret = filedialog.asksaveasfilename(filetypes=[
-            (_("All supported files"), "*.kicad_pcb;*.json;*.scad;*.svg"),
-            (_("KiCad PCB files"), "*.kicad_pcb"),
-            (_("EasyEDA JSON files"), "*.json"),
-            (_("OpenSCAD files"), "*.scad"),
-            (_("SVG files"), "*.svg"),
+            fmtInfo,
             (_("All files"), "*.*")
-        ], typevariable=selectedFilter)
+        ])
         if ret:
             rootName, ext = os.path.splitext(ret)
             if not ext:
-                choiceName = selectedFilter.get()
-                targetExt = FILE_TYPES_MAP.get(choiceName)
-                if targetExt:
-                    ret = rootName + targetExt
+                ret = rootName + fmt
             self.txtExportFile.setText(ret)
+            if fmt == '.kicad_mod':
+                self._updateExportComponentList()
 
     #选择一个SVG文件
     def cmdSvgFile_Cmd(self, event=None):
@@ -567,6 +571,36 @@ class Application(Application_ui):
 
     def cmdCancelExport_Cmd(self, event=None):
         self.cmdCancel_Cmd(event)
+
+    #导出格式下拉框变化时, 显示/隐藏对应的控件
+    def cmdExportFormat_Cmd(self, event=None):
+        FORMAT_EXT_MAP = {
+            'KiCad PCB (*.kicad_pcb)': '.kicad_pcb',
+            'KiCad Footprint (*.kicad_mod)': '.kicad_mod',
+            'EasyEDA JSON (*.json)': '.json',
+            'OpenSCAD (*.scad)': '.scad',
+            'SVG (*.svg)': '.svg',
+        }
+        fmtText = self.cmbExportFormat.text()
+        fmt = FORMAT_EXT_MAP.get(fmtText, '.kicad_pcb')
+        isKicadMod = (fmt == '.kicad_mod')
+        isScad = (fmt == '.scad')
+        isSvg = (fmt == '.svg')
+        isLayerFormat = isScad or isSvg
+
+        #Component选择框: 仅.kicad_mod时显示
+        stateComp = 'readonly' if isKicadMod else 'disabled'
+        self.cmbExportComponent.configure(state=stateComp)
+        if isKicadMod:
+            self._updateExportComponentList()
+
+        #Layer选择框和标签: 仅OpenSCAD和SVG时显示
+        stateLayer = 'readonly' if isLayerFormat else 'disabled'
+        self.cmbExportLayer.configure(state=stateLayer)
+
+        #Layered OpenSCAD复选框: 仅OpenSCAD时显示
+        stateChk = 'normal' if isScad else 'disabled'
+        self.chkLayeredScad.configure(state=stateChk)
 
     def cmdCancelSvg_Cmd(self, event=None):
         self.cmdCancel_Cmd(event)
@@ -680,6 +714,7 @@ class Application(Application_ui):
     #点击了导出按钮
     def cmdExport_Cmd(self, event=None):
         from conversion.sprint_to_kicad import KicadGenerator
+        from conversion.sprint_to_kicad_mod import KicadModGenerator
         from conversion.sprint_to_lceda import LcedaGenerator
         from conversion.sprint_to_openscad import OpenSCADGenerator
         from conversion.sprint_to_svg import SVGGenerator
@@ -689,33 +724,101 @@ class Application(Application_ui):
         if not outFileName:
             showwarning(_('info'), _('Input is empty'))
             return
-        elif not outFileName.lower().endswith(('.kicad_pcb', '.json', '.scad', '.svg')):
-            showwarning(_('info'), _('Cannot detect export type. Please add a file extension'))
-            return
+
+        FORMAT_EXT_MAP = {
+            'KiCad PCB (*.kicad_pcb)': '.kicad_pcb',
+            'KiCad Footprint (*.kicad_mod)': '.kicad_mod',
+            'EasyEDA JSON (*.json)': '.json',
+            'OpenSCAD (*.scad)': '.scad',
+            'SVG (*.svg)': '.svg',
+        }
+        fmtText = self.cmbExportFormat.text()
+        fmt = FORMAT_EXT_MAP.get(fmtText, '.kicad_pcb')
+        if fmt == '.kicad_pcb' and not outFileName.lower().endswith('.kicad_pcb'):
+            outFileName += '.kicad_pcb'
+        elif fmt == '.kicad_mod' and not outFileName.lower().endswith('.kicad_mod'):
+            outFileName += '.kicad_mod'
+        elif fmt == '.json' and not outFileName.lower().endswith('.json'):
+            outFileName += '.json'
+        elif fmt == '.scad' and not outFileName.lower().endswith('.scad'):
+            outFileName += '.scad'
+        elif fmt == '.svg' and not outFileName.lower().endswith('.svg'):
+            outFileName += '.svg'
+        self.txtExportFile.setText(outFileName)
 
         textIo = self.createTextIoFromInFile()
         if not textIo:
             return False
 
-        if outFileName.lower().endswith('.kicad_pcb'):
+        if fmt == '.kicad_pcb':
             generator = KicadGenerator(textIo)
-        elif outFileName.lower().endswith('.json'):
+        elif fmt == '.kicad_mod':
+            comp = self._getSelectedExportComponent(textIo)
+            if not comp:
+                return
+            generator = KicadModGenerator(comp)
+        elif fmt == '.json':
             generator = LcedaGenerator(textIo)
-        elif outFileName.lower().endswith('.scad'):
-            generator = OpenSCADGenerator(textIo)
-        elif outFileName.lower().endswith('.svg'):
-            layer = self.cmbExportLayer.current()
-            generator = SVGGenerator(textIo, layers=layer)
-        else:
+        elif fmt == '.scad':
             layer = self.cmbExportLayer.current()
             layered = self.chkLayeredScad.value()
             generator = OpenSCADGenerator(textIo, layers=layer, layered=layered)
+        elif fmt == '.svg':
+            layer = self.cmbExportLayer.current()
+            generator = SVGGenerator(textIo, layers=layer)
+        else:
+            showwarning(_('info'), _('Cannot detect export type'))
+            return
+
         errStr = generator.generate(outFileName)
         if errStr:
             showwarning(_('info'), errStr)
         else:
             showinfo(_("info"), _("Export file successfully"))
+
+    #获取导出.kicad_mod时用户选中的元件
+    def _getSelectedExportComponent(self, textIo):
+        from sprint_struct.sprint_component import SprintComponent
+        components = [elem for elem in textIo.elements if isinstance(elem, SprintComponent)]
+        if not components:
+            showwarning(_('info'), _('No components found in the file'))
+            return None
+
+        compNames = []
+        for idx, comp in enumerate(components):
+            name = comp.idText.text or comp.comment or f'Component_{idx + 1}'
+            compNames.append(name)
+
+        #获取用户在下拉框中选择的元件索引
+        try:
+            selIdx = self.cmbExportComponent.current()
+        except:
+            selIdx = 0
+
+        if selIdx < 0 or selIdx >= len(components):
+            selIdx = 0
+
+        return components[selIdx]
     
+    #更新导出.kicad_mod时的元件选择下拉框
+    def _updateExportComponentList(self):
+        from sprint_struct.sprint_component import SprintComponent
+        compNames = []
+        try:
+            textIo = self.createTextIoFromInFile()
+            if textIo:
+                components = [elem for elem in textIo.elements if isinstance(elem, SprintComponent)]
+                for idx, comp in enumerate(components):
+                    name = comp.idText.text or comp.comment or f'Component_{idx + 1}'
+                    compNames.append(name)
+        except:
+            pass
+
+        self.cmbExportComponentList = compNames if compNames else ['']
+        self.cmbExportComponent.configure(values=self.cmbExportComponentList)
+        if compNames:
+            self.cmbExportComponent.current(0)
+
     #转换SVG结果保存为单独一个文本文件
     def lblSaveAsSvg_Button_1(self, event):
         self.cmdOkSvg_Cmd(saveas=True)

@@ -132,3 +132,4 @@ dmypy.json
 .pyre/
 sprintFont 使用手册.pdf
 docs/sprintFont manual (english).pdf
+/.vs

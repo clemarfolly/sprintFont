@@ -350,6 +350,10 @@ Kicad自带很多封装库，如果不想安装Kicad，也可以仅仅下载封�
   3. Dynamic UI: Component combo only enabled for KiCad Footprint; Layer combo and checkbox only for OpenSCAD/SVG
   4. Component list auto-populates when selecting KiCad Footprint format
   5. Pad number priority: NAME (if numeric) > padId > default '1'
+  6. KiCad PCB: free thru-hole pads exported as vias instead of single-pad footprints
+  7. KiCad PCB+Footprint: filled arcs (e.g. filled semicircles) exported as polygons with one point every 10 degrees
+  8. KiCad PCB: footprint library (.pretty) generated next to the board; equal footprints (same silkscreen + pad sizes/distances) share one library footprint (R_XXX, C_XXX, CP_XXX, D_XXX, Conn_XXX, T_XXX, DIPXX_YYY, _T2 suffix on type collision)
+  9. KiCad PCB+Footprint: native zones only on copper layers (non-copper polygons become gr_poly/board outline); CUTOUT pour overlaps become native keepout zones; SOLDERMASK=true elements get an opening copy on F.Mask/B.Mask
 
 ### v1.9
   1. 添加 "批处理修改" 功能

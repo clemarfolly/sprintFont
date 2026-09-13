@@ -751,7 +751,8 @@ class Application(Application_ui):
             return False
 
         if fmt == '.kicad_pcb':
-            generator = KicadGenerator(textIo)
+            libFolder = os.path.splitext(outFileName)[0] + '.pretty'
+            generator = KicadGenerator(textIo, libFolder=libFolder)
         elif fmt == '.kicad_mod':
             comp = self._getSelectedExportComponent(textIo)
             if not comp:

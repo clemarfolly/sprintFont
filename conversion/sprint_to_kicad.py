@@ -4,10 +4,12 @@
 比Gerber要好, 能保留大部分可编辑信息, 但是不完美, 因为没有网表
 Author: cdhigh <https://github.com/cdhigh>
 """
-import datetime, uuid
+import datetime, math, os, uuid
 from .kicad_definitions import *
 from sprint_struct.sprint_textio import *
 from .netlist_builder import NetlistBuilder
+from .kicad_footprint_lib import assignLibraryFootprints
+from .sprint_to_kicad_mod import KicadModGenerator
 
 def uuid4():
     return str(uuid.uuid4())
@@ -21,11 +23,20 @@ def r2(value):
 
 class KicadGenerator:
     #textIo: SprintTextIO对象
-    def __init__(self, textIo):
+    #libFolder: 生成封装库(.pretty目录)的路径, 为空则不生成封装库
+    def __init__(self, textIo, libFolder=None):
         self.textIo = textIo
+        self.libFolder = libFolder
         self._componentNo = 0
         builder = NetlistBuilder(textIo)
         self.netlist = builder.build()
+        #相同封装的元件共用库中的同一个footprint
+        self.libNames = {}
+        self.libRepComps = {}
+        if libFolder:
+            comps = [e for e in textIo.children() if isinstance(e, SprintComponent)]
+            if comps:
+                self.libNames, self.libRepComps = assignLibraryFootprints(comps)
 
     def compNo(self):
         self._componentNo += 1
@@ -41,13 +52,37 @@ class KicadGenerator:
                 self.writeNetlist(f)
                 self.writeElements(f)
                 self.writeFooter(f)
-            return ''
+            return self.writeLibrary()
         except Exception as e:
             return str(e)
+
+    #将库中每种footprint存为一个.kicad_mod文件, 失败返回错误信息
+    def writeLibrary(self):
+        if not self.libFolder or not self.libRepComps:
+            return ''
+        try:
+            os.makedirs(self.libFolder, exist_ok=True)
+        except Exception as e:
+            return str(e)
+        for name, comp in self.libRepComps.items():
+            err = KicadModGenerator(comp, name, forLibrary=True).generate(
+                os.path.join(self.libFolder, name + '.kicad_mod'))
+            if err:
+                return f"{name}: {err}"
+        return ''
 
     #Get KiCad layer name from Sprint layer index
     def getLayerName(self, layerIdx):
         return sprintLayerMap.get(layerIdx, "Dwgs.User")
+
+    #SOLDERMASK=true elements get an opening copy on the mask layer
+    #front side (C1/S1/I1) -> F.Mask, back side (C2/S2/I2) -> B.Mask, rest -> None
+    def maskLayerFor(self, layerIdx):
+        if layerIdx in (LAYER_C1, LAYER_S1, LAYER_I1):
+            return 'F.Mask'
+        if layerIdx in (LAYER_C2, LAYER_S2, LAYER_I2):
+            return 'B.Mask'
+        return None
 
     def writeHeader(self, f):
         dateStr = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -147,14 +182,20 @@ class KicadGenerator:
     def writeElements(self, f):
         self._processGroup(f, self.textIo)
 
-    def _processGroup(self, f, group, centroid=(0,0)):
-        padNo = 0
+    def _processGroup(self, f, group, centroid=(0,0), isFree=True, _padNo=None):
+        #_padNo为共享计数器, 保证分组内焊盘和库文件中的焊盘序号一致
+        if _padNo is None:
+            _padNo = [0]
         for elem in group.elements:
             if isinstance(elem, SprintTrack):
                 self._writeTrack(f, elem, centroid)
             elif isinstance(elem, SprintPad):
-                padNo += 1
-                self._writePad(f, elem, centroid, padNo)
+                _padNo[0] += 1
+                #Free thru-hole pad (not grouped, not in component) becomes a via
+                if centroid == (0,0) and isFree and elem.padType == 'PAD' and elem.drill:
+                    self._writeVia(f, elem)
+                else:
+                    self._writePad(f, elem, centroid, _padNo[0])
             elif isinstance(elem, SprintPolygon):
                 self._writeZone(f, elem, centroid)
             elif isinstance(elem, SprintText):
@@ -162,7 +203,7 @@ class KicadGenerator:
             elif isinstance(elem, SprintCircle):
                 self._writeCircle(f, elem, centroid)
             elif isinstance(elem, SprintGroup):
-                self._processGroup(f, elem, centroid)
+                self._processGroup(f, elem, centroid, isFree=False, _padNo=_padNo)
             elif isinstance(elem, SprintComponent):
                 self._writeComponent(f, elem)
 
@@ -182,6 +223,9 @@ class KicadGenerator:
         space = '  ' if centroid == (0,0) else '    '
 
         layer = self.getLayerName(track.layerIdx)
+        #SOLDERMASK=true: copper artwork stays, plus an opening copy on mask
+        maskLayer = self.maskLayerFor(track.layerIdx) if getattr(track, 'soldermask', None) else None
+        maskName = 'fp_line' if centroid != (0,0) else 'gr_line'
         if centroid != (0,0): #封装内不管是导线还是绘图线都使用fp_line
             name = 'fp_line'
             width = f'(stroke (width {r2(track.width)}) (type solid))'
@@ -203,6 +247,29 @@ class KicadGenerator:
             x2, y2 = r2(p2[0] - centroid[0]), r2(p2[1] - centroid[1])
             f.write(f'{space}({name} (start {x1} {y1}) (end {x2} {y2}) '
                    f'{width} (layer {layer}) {net}(uuid {uuid4()}))\n')
+            if maskLayer:
+                f.write(f'{space}({maskName} (start {x1} {y1}) (end {x2} {y2}) '
+                       f'{width} (layer {maskLayer}) (uuid {uuid4()}))\n')
+
+    #Free thru-hole pad exported as via (not grouped, not in component)
+    #Format: (via (at x y) (size d) (drill d) (layers "F.Cu" "B.Cu") (net n) (uuid UUID))
+    #f: file handle
+    #pad: SprintPad instance (padType PAD with drill)
+    def _writeVia(self, f, pad):
+        x, y = r2(pad.pos[0]), r2(pad.pos[1])
+        sizeX, sizeY = pad.sizeX, pad.sizeY
+        if pad.form in (PAD_FORM_RECT_H, PAD_FORM_RECT_ROUND_H, PAD_FORM_RECT_OCTAGON_H):
+            sizeX *= 2
+        elif pad.form in (PAD_FORM_RECT_V, PAD_FORM_RECT_ROUND_V, PAD_FORM_RECT_OCTAGON_V):
+            sizeY *= 2
+        viaSize = max(max(sizeX, sizeY), 0.1)
+        drill = pad.drill or 0
+        if drill <= 0 or drill >= viaSize:
+            viaSize = max(viaSize, drill + 0.2)
+        viaSize, drill = r2(viaSize), r2(drill)
+        netNum = self.netlist['element_net_map'].get(id(pad), 0)
+        f.write(f'  (via (at {x} {y}) (size {viaSize}) (drill {drill}) '
+               f'(layers "F.Cu" "B.Cu") (net {netNum}) (uuid {uuid4()}))\n')
 
     #转换焊盘,kicad不允许孤立焊盘存在,必须依附于某个footprint,
     #如果没有外层footprint, 这里需要创建一个footprint包裹焊盘
@@ -278,35 +345,93 @@ class KicadGenerator:
     def _writeZone(self, f, zone, centroid=(0,0)):
         layer = self.getLayerName(zone.layerIdx)
         if centroid == (0,0):
-            netNum = self.netlist['element_net_map'].get(id(zone), 0)
-            netName = f"Net-{netNum}" if netNum > 0 else ""
-            f.write(f'  (zone (net {netNum}) (net_name "{netName}") (layer {layer}) (uuid {uuid4()}) (hatch edge 0.5)\n')
-            f.write(f'    (connect_pads (clearance {zone.clearance}))\n')
-            if zone.cutout: #禁止铺铜区
-                f.write('    (min_thickness 0.1) (filled_areas_thickness no)\n')
-                f.write('    (keepout (tracks allowed) (vias allowed) (pads allowed)'
-                        ' (copperpour not_allowed) (footprints allowed))\n')
-            else:
-                f.write('    (min_thickness 0.254) (filled_areas_thickness no)\n')
-            f.write('    (fill yes (thermal_gap 0.5) (thermal_bridge_width 0.5))\n')
-            f.write('    (polygon\n')
-            f.write('      (pts\n')
-            for p in zone.points:
-                f.write(f'        (xy {r2(p[0] - centroid[0])} {r2(p[1] - centroid[1])})\n')
-            f.write('      )\n')
-            f.write('    )\n')
-            f.write('  )\n')
+            self._writeBoardZone(f, zone, layer)
         else:
             #封装内的禁止铺铜区不能在铜层创建多边形, 否则会短路
-            if zone.cutout and layer.endswith('.Cu'):
+            rawIsCopper = layer.endswith('.Cu')
+            if zone.cutout and rawIsCopper:
                 layer = "Cmts.User"
+            pts = [(r2(p[0] - centroid[0]), r2(p[1] - centroid[1])) for p in zone.points]
             f.write('    (fp_poly\n')
             f.write('      (pts\n')
-            for p in zone.points:
-                f.write(f'        (xy {r2(p[0] - centroid[0])} {r2(p[1] - centroid[1])})\n')
+            for x, y in pts:
+                f.write(f'        (xy {x} {y})\n')
             f.write('      )\n')
             f.write(f'      (layer {layer}) (stroke (width {zone.width}) (type solid)) (fill yes) (uuid {uuid4()})\n')
             f.write('    )\n')
+            #SOLDERMASK=true: 另在阻焊层加同样的开口拷贝
+            hasMaskFlag = getattr(zone, 'soldermask', None) or getattr(zone, 'soldermaskCutout', None)
+            if hasMaskFlag and not (zone.cutout and rawIsCopper):
+                maskLayer = self.maskLayerFor(zone.layerIdx)
+                if maskLayer:
+                    self._writeMaskPoly(f, pts, maskLayer, zone.width, 'fp_poly', '    ')
+
+    #电路板层的多边形, 只有铜层才能转换为原生zone, 其他板层转换为图形对象
+    #Sprint不允许铺铜区带空洞, 用户用CUTOUT多边形压在铺铜上来挖空,
+    #这里转换为原生的keepout zone, KiCad填充时自动打出空洞
+    def _writeBoardZone(self, f, zone, layer):
+        pts = [(r2(p[0]), r2(p[1])) for p in zone.points]
+        if len(pts) < 3:
+            return #退化轮廓, KiCad无法加载
+        isCopper = layer.endswith('.Cu')
+        hasMaskFlag = getattr(zone, 'soldermask', None) or getattr(zone, 'soldermaskCutout', None)
+        if isCopper:
+            self._writeCopperZone(f, zone, layer, pts, isKeepout=bool(zone.cutout))
+            #SOLDERMASK=true: 铜图形保留, 另在阻焊层加同样的开口拷贝
+            if hasMaskFlag and not zone.cutout:
+                maskLayer = self.maskLayerFor(zone.layerIdx)
+                if maskLayer:
+                    self._writeMaskPoly(f, pts, maskLayer, zone.width, 'gr_poly', '  ')
+        elif zone.cutout:
+            #非铜层的禁区转换为通用keepout规则区, 任何板层都合法
+            self._writeCopperZone(f, zone, layer, pts, isKeepout=True)
+        elif layer == 'Edge.Cuts':
+            #板框外形转换为闭合gr_line环
+            for i in range(len(pts)):
+                p1, p2 = pts[i], pts[(i + 1) % len(pts)]
+                f.write(f'  (gr_line (start {p1[0]} {p1[1]}) (end {p2[0]} {p2[1]}) '
+                       f'(layer Edge.Cuts) (stroke (width {r2(zone.width)}) (type solid)) (uuid {uuid4()}))\n')
+        else:
+            #丝印等 artwork 转换为图形多边形
+            f.write('  (gr_poly\n')
+            f.write('    (pts\n')
+            for x, y in pts:
+                f.write(f'      (xy {x} {y})\n')
+            f.write('    )\n')
+            f.write(f'    (layer {layer}) (stroke (width {r2(zone.width)}) (type solid)) (fill yes) (uuid {uuid4()})\n')
+            f.write('  )\n')
+
+    #SOLDERMASK=true的开口拷贝, 同样的多边形画到阻焊层
+    #name: 'gr_poly'或'fp_poly'
+    def _writeMaskPoly(self, f, pts, maskLayer, width, name, space):
+        f.write(f'{space}({name}\n')
+        f.write(f'{space}  (pts\n')
+        for x, y in pts:
+            f.write(f'{space}    (xy {x} {y})\n')
+        f.write(f'{space}  )\n')
+        f.write(f'{space}  (layer {maskLayer}) (stroke (width {r2(width)}) (type solid)) (fill yes) (uuid {uuid4()})\n')
+        f.write(f'{space})\n')
+
+    #原生铜区或keepout区, keepout压在铜区上形成与Sprint CUTOUT等效的空洞
+    def _writeCopperZone(self, f, zone, layer, pts, isKeepout):
+        netNum = 0 if isKeepout else self.netlist['element_net_map'].get(id(zone), 0)
+        netName = "" if isKeepout else (f"Net-{netNum}" if netNum > 0 else "")
+        f.write(f'  (zone (net {netNum}) (net_name "{netName}") (layer {layer}) (uuid {uuid4()}) (hatch edge 0.5)\n')
+        f.write(f'    (connect_pads (clearance {zone.clearance}))\n')
+        if isKeepout: #禁止铺铜区
+            f.write('    (min_thickness 0.1) (filled_areas_thickness no)\n')
+            f.write('    (keepout (tracks allowed) (vias allowed) (pads allowed)'
+                    ' (copperpour not_allowed) (footprints allowed))\n')
+        else:
+            f.write('    (min_thickness 0.254) (filled_areas_thickness no)\n')
+        f.write('    (fill yes (thermal_gap 0.5) (thermal_bridge_width 0.5))\n')
+        f.write('    (polygon\n')
+        f.write('      (pts\n')
+        for x, y in pts:
+            f.write(f'        (xy {x} {y})\n')
+        f.write('      )\n')
+        f.write('    )\n')
+        f.write('  )\n')
 
     #转换文本
     #格式: (gr_text "content" (at x y angle) (layer LayerName) (effects ...) (uuid UUID) ...)
@@ -338,6 +463,12 @@ class KicadGenerator:
         f.write(f'{space}({name} "{content}" (at {x} {y} {rotation}) (layer {layer}) (uuid {uuid4()})\n')
         f.write(f'{space}  (effects (font (size {height} {height})){justify})\n')
         f.write(f'{space})\n')
+        #SOLDERMASK=true: opening copy on mask layer
+        maskLayer = self.maskLayerFor(text.layerIdx) if getattr(text, 'soldermask', None) else None
+        if maskLayer:
+            f.write(f'{space}({name} "{content}" (at {x} {y} {rotation}) (layer {maskLayer}) (uuid {uuid4()})\n')
+            f.write(f'{space}  (effects (font (size {height} {height})){justify})\n')
+            f.write(f'{space})\n')
 
     #转换圆弧
     #格式: (gr_circle (center x y) (end x y) (stroke ...) (layer LayerName) (fill no)...)
@@ -347,11 +478,23 @@ class KicadGenerator:
     #centroid: 所属元件(footprint)的几何中心, =(0,0)为孤立元素
     def _writeCircle(self, f, circle, centroid=(0,0)):
         layer = self.getLayerName(circle.layerIdx)
+        space = '  ' if centroid == (0,0) else '    '
+        self._writeCircleOnLayer(f, circle, centroid, layer, space)
+        #SOLDERMASK=true: opening copy on mask layer
+        maskLayer = self.maskLayerFor(circle.layerIdx) if getattr(circle, 'soldermask', None) else None
+        if maskLayer:
+            self._writeCircleOnLayer(f, circle, centroid, maskLayer, space)
+
+    #圆/圆弧绘制到指定板层
+    #f: 文件句柄
+    #circle: SprintCircle实例
+    #centroid: 所属元件(footprint)的几何中心, =(0,0)为孤立元素
+    #layer/space: 目标板层名和缩进
+    def _writeCircleOnLayer(self, f, circle, centroid, layer, space):
         start = r2(circle.start)
         stop = r2(circle.stop)
         cx, cy = r2(circle.center[0] - centroid[0]), r2(circle.center[1] - centroid[1])
         fill = 'yes' if circle.fill else 'no'
-        space = '  ' if centroid == (0,0) else '    '
 
         # 正圆
         if start == stop:
@@ -360,7 +503,10 @@ class KicadGenerator:
             name = 'gr_circle' if centroid == (0,0) else 'fp_circle'
             f.write(f'{space}({name} (center {cx} {cy}) (end {endX} {endY}) '
                    f'(stroke (width {r2(circle.width)}) (type solid)) (fill {fill}) '
-                 f'(layer {layer}) (uuid {uuid4()}))\n')
+                  f'(layer {layer}) (uuid {uuid4()}))\n')
+        elif circle.fill:
+            #填充圆弧(比如填充半圆): 圆弧无法表示填充半盘, 导出为每10度一个点的多边形
+            self._writeArcPolygon(f, circle, centroid, layer, space)
         else: # 圆弧
             name = 'gr_arc' if centroid == (0,0) else 'fp_arc'
             start, mid, end = circle.calcStartEndMidPoint()
@@ -369,7 +515,35 @@ class KicadGenerator:
             end = r2(end[0] - centroid[0]), r2(end[1] - centroid[1])
             f.write(f'{space}({name} (start {start[0]} {start[1]}) (mid {mid[0]} {mid[1]}) (end {end[0]} {end[1]}) '
                    f'(stroke (width {r2(circle.width)}) (type solid)) (fill {fill}) '
-                 f'(layer {layer}) (uuid {uuid4()}))\n')
+                  f'(layer {layer}) (uuid {uuid4()}))\n')
+
+    #填充圆弧导出为多边形, 沿圆弧每10度取一个点, 多边形自动闭合形成填充半盘
+    #格式: (gr_poly (pts (xy X Y)...) (layer LayerName) (stroke ...) (fill yes) (uuid UUID))
+    #或: (fp_poly (pts (xy X Y)...) (layer LayerName) (stroke ...) (fill yes) (uuid UUID))
+    #f: 文件句柄
+    #circle: SprintCircle实例(填充圆弧, start != stop)
+    #centroid: 所属元件(footprint)的几何中心, =(0,0)为孤立元素
+    #layer/space: 板层名和缩进, 和调用方保持一致
+    def _writeArcPolygon(self, f, circle, centroid, layer, space):
+        sweep = (circle.stop - circle.start) % 360
+        if sweep == 0:
+            sweep = 360
+        steps = max(int(math.ceil(sweep / 10.0)), 1)
+        cx0, cy0 = circle.center
+        pts = []
+        for i in range(steps + 1):
+            angle = math.radians(circle.start + sweep * i / steps)
+            x = r2(cx0 + circle.radius * math.cos(angle) - centroid[0])
+            y = r2(cy0 - circle.radius * math.sin(angle) - centroid[1])
+            pts.append((x, y))
+        name = 'gr_poly' if centroid == (0,0) else 'fp_poly'
+        f.write(f'{space}({name}\n')
+        f.write(f'{space}  (pts\n')
+        for x, y in pts:
+            f.write(f'{space}    (xy {x} {y})\n')
+        f.write(f'{space}  )\n')
+        f.write(f'{space}  (layer {layer}) (stroke (width {r2(circle.width)}) (type solid)) (fill yes) (uuid {uuid4()})\n')
+        f.write(f'{space})\n')
 
     #元件, 生成一个footprint
     #f: file对象
@@ -378,7 +552,9 @@ class KicadGenerator:
         centroid = comp.centroid()
         layer = self.getLayerName(comp.layerIdx)
         compNo = self.compNo()
-        fpId = f"FP_{int(centroid[0] * 100)}_{int(centroid[1] * 100)}_{compNo}"
+        #相同封装的元件使用库中同一个footprint名
+        libName = self.libNames.get(id(comp))
+        fpId = libName if libName else f"FP_{int(centroid[0] * 100)}_{int(centroid[1] * 100)}_{compNo}"
         f.write(f'  (footprint "{fpId}" (layer "{layer}")\n')
         f.write(f'    (at {r2(centroid[0])} {r2(centroid[1])} 0) (uuid {uuid4()})\n')
 
@@ -409,11 +585,12 @@ class KicadGenerator:
             f' (hide {hide}) (uuid {uuid4()}) (effects (font (size {height} {height}) (thickness 0.15))))\n')
 
         #Footprint (封装源)：表示是从哪个库里的哪个封装来的。比如:Package_SO:SOIC-8_3.9x4.9mm_P1.27mm
-        f.write(f'    (property "Footprint" "" (at 0 0 0) (unlocked yes) (layer "{layer.replace(".Cu", ".Fab")}") (hide yes) (uuid {uuid4()}) (effects (font (size 1 1) (thickness 0.15))))\n')
+        footprintLink = libName if libName else ""
+        f.write(f'    (property "Footprint" "{footprintLink}" (at 0 0 0) (unlocked yes) (layer "{layer.replace(".Cu", ".Fab")}") (hide yes) (uuid {uuid4()}) (effects (font (size 1 1) (thickness 0.15))))\n')
         f.write(f'    (attr {comp.getMountingType()})\n')
 
         #转换下层元素
-        self._processGroup(f, comp, centroid)
+        self._processGroup(f, comp, centroid, isFree=False)
         f.write(f'  )\n')
 
     def writeFooter(self, f):
